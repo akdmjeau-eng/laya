@@ -1,0 +1,229 @@
+name: Termux ARM64 C++ Network Lab
+
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - "**.cpp"
+      - "**.h"
+      - "scripts/**"
+      - ".github/workflows/termux-arm64-lab.yml"
+
+  pull_request:
+    branches: [ "master" ]
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+
+  platform-diagnostic:
+    name: Platform diagnostic
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System information
+        shell: bash
+        run: |
+          set -eux
+
+          echo "=== HOST ==="
+          uname -a
+          uname -m
+
+          echo "=== CPU ==="
+          lscpu | head -40
+
+          echo "=== MEMORY ==="
+          free -h
+
+          echo "=== STORAGE ==="
+          df -h
+
+          echo "=== COMPILERS ==="
+          g++ --version
+          clang++ --version
+
+          echo "=== CMAKE ==="
+          cmake --version
+
+      - name: Android/Termux compatibility report
+        shell: bash
+        run: |
+          set -u
+
+          mkdir -p artifacts
+
+          {
+            echo "=== BUILD ENVIRONMENT ==="
+            echo "GitHub runner: $RUNNER_OS"
+            echo "Architecture: $RUNNER_ARCH"
+            echo
+
+            echo "=== HOST KERNEL ==="
+            uname -a
+            echo
+
+            echo "=== GCC ==="
+            g++ --version | head -1
+            echo
+
+            echo "=== CLANG ==="
+            clang++ --version | head -1
+            echo
+
+            echo "=== TARGET NOTES ==="
+            echo "Android target: API 35"
+            echo "Preferred ABI: arm64-v8a"
+            echo "Termux: Android userspace"
+          } | tee artifacts/platform-report.txt
+
+      - name: Upload diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-report
+          path: artifacts/platform-report.txt
+
+
+  cpp-build:
+    name: C++ build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            ninja-build
+
+      - name: Locate C++ sources
+        run: |
+          echo "=== C++ FILES ==="
+          find . -type f \
+            \( -name "*.cpp" -o -name "*.cc" -o -name "*.cxx" \) \
+            -print
+
+      - name: Compile can_reader when present
+        shell: bash
+        run: |
+          set -eux
+
+          if [ -f can_reader.cpp ]; then
+            mkdir -p build
+
+            g++ \
+              -std=c++17 \
+              -O2 \
+              -Wall \
+              -Wextra \
+              -Wpedantic \
+              can_reader.cpp \
+              -o build/can_reader
+
+            file build/can_reader
+            ./build/can_reader --help || true
+          else
+            echo "can_reader.cpp not present; skipping"
+          fi
+
+      - name: CMake build when project exists
+        shell: bash
+        run: |
+          set -eux
+
+          if [ -f CMakeLists.txt ]; then
+            cmake -S . -B build-cmake \
+              -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release
+
+            cmake --build build-cmake \
+              --parallel 2
+          else
+            echo "No CMakeLists.txt; skipping"
+          fi
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpp-build
+          path: |
+            build/**
+            build-cmake/**
+          if-no-files-found: ignore
+
+
+  network-lab:
+    name: Isolated network lab
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Install network tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            iproute2 \
+            can-utils
+
+      - name: Create vcan0
+        shell: bash
+        run: |
+          set -eux
+
+          sudo modprobe vcan
+
+          sudo ip link add \
+            dev vcan0 \
+            type vcan
+
+          sudo ip link set \
+            vcan0 up
+
+          ip -details link show vcan0
+
+      - name: Passive CAN test
+        shell: bash
+        run: |
+          set -eux
+
+          timeout 5s \
+            candump -L vcan0 \
+            > candump.log 2>&1 &
+
+          PID=$!
+
+          sleep 1
+
+          cansend vcan0 123#11223344
+          cansend vcan0 456#AABBCCDD
+
+          sleep 1
+
+          kill "$PID" 2>/dev/null || true
+
+          cat candump.log
+
+      - name: Network interface report
+        run: |
+          echo "=== INTERFACES ==="
+          ip -br link
+
+          echo
+          echo "=== CAN ==="
+          ip -details link show type can || true
+
+      - name: Upload CAN log
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-lab
+          path: candump.log
